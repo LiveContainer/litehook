@@ -17,7 +17,7 @@
 #include <mach-o/dyld_images.h>
 #include <sys/syslimits.h>
 #include <dispatch/dispatch.h>
-#include <dyld_cache_format.h>
+#include "dyld_cache_format.h"
 #include <ptrauth.h>
 #include <sys/mman.h>
 
