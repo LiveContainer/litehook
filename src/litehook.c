@@ -26,7 +26,7 @@
 #define _COMM_PAGE_TPRO_WRITE_ENABLE (_COMM_PAGE_START_ADDRESS + 0x0D0)
 #define _COMM_PAGE_TPRO_WRITE_DISABLE (_COMM_PAGE_START_ADDRESS + 0x0D8)
 
-static bool os_tpro_is_supported(void)
+bool os_tpro_is_supported(void)
 {
 	if (*(uint64_t*)_COMM_PAGE_TPRO_WRITE_ENABLE) {
 		return true;

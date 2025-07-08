@@ -25,3 +25,7 @@ kern_return_t litehook_hook_function(void *source, void *target);
 
 #define LITEHOOK_REBIND_GLOBAL NULL
 void litehook_rebind_symbol(const mach_header_u *targetHeader, void *replacee, void *replacement, bool (*exceptionFilter)(const mach_header_u *header));
+
+bool os_tpro_is_supported(void);
+void os_thread_self_restrict_tpro_to_rw(void);
+void os_thread_self_restrict_tpro_to_ro(void);
