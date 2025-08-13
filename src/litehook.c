@@ -289,6 +289,62 @@ void *litehook_find_symbol(const mach_header_u *header, const char *symbolName)
 	return NULL;
 }
 
+void *litehook_find_symbol_file(const mach_header_u *header, const char *symbolName)
+{
+    struct symtab_command *symtabCommand = NULL;
+
+    uint32_t slide = -1;
+
+    uint32_t off = 0;
+    for (uint32_t i = 0; i < header->ncmds && off < header->sizeofcmds; i++) {
+        struct load_command *lc = (struct load_command *)((uintptr_t)header + sizeof(mach_header_u) + off);
+
+        if (lc->cmd == LC_SYMTAB) {
+            symtabCommand = (struct symtab_command *)lc;
+        }
+        else if (lc->cmd == LC_SEGMENT_U) {
+            segment_command_u *segCmd = (segment_command_u *)lc;
+            if (slide == -1) {
+                slide = (uintptr_t)header - segCmd->vmaddr;
+            }
+        }
+
+        if (symtabCommand) break;
+
+        off += lc->cmdsize;
+    }
+
+    if (!symtabCommand) return NULL;
+
+    nlist_u *syms = (nlist_u *)((void*)header + symtabCommand->symoff);
+    char *strtbl = (char *)((void*)header + symtabCommand->stroff);
+    size_t strtblSize = symtabCommand->strsize;
+
+    for (uint32_t i = 0; i < symtabCommand->nsyms; i++) {
+        nlist_u *symEntry = &syms[i];
+
+        uint32_t stroff = symEntry->n_un.n_strx;
+        if (stroff >= strtblSize || off == 0) {
+            continue;
+        }
+
+        if ((symEntry->n_type & N_TYPE) != N_SECT) {
+            continue;
+        }
+
+        const char* curSymbolName = &strtbl[stroff];
+        if (curSymbolName[0] == '\x00') {
+            continue;
+        }
+
+        if (!strcmp(curSymbolName, symbolName)) {
+            return _litehook_sign_if_executable((void *)((uintptr_t)header + symEntry->n_value));
+        }
+    }
+
+    return NULL;
+}
+
 void *litehook_find_dsc_symbol(const char *imagePath, const char *symbolName)
 {
 	const char *mainDSCPath = litehook_locate_dsc();
@@ -427,13 +483,6 @@ void _litehook_rebind_symbol_in_section(const mach_header_u *targetHeader, secti
 		}
 	}
 }
-
-typedef struct {
-	const mach_header_u *sourceHeader;
-	void *replacee;
-	void *replacement;
-	bool (*exceptionFilter)(const mach_header_u *header);
-} global_rebind;
 
 uint32_t gRebindCount = 0;
 global_rebind *gRebinds = NULL;
