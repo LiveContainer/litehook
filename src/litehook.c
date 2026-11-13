@@ -20,6 +20,63 @@
 #include "dyld_cache_format.h"
 #include <ptrauth.h>
 #include <sys/mman.h>
+#include <errno.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/time.h>
+#include <sys/stat.h>
+
+void litehook_diagnostic_log(const char *format, ...)
+{
+    // Avoid Foundation/NSUserDefaults while their hooks are being installed.
+    int savedErrno = errno;
+    const char *home = getenv("LC_HOME_PATH");
+    if (!home || !home[0]) {
+        errno = savedErrno;
+        return;
+    }
+    char path[PATH_MAX];
+    int length = snprintf(path, sizeof(path), "%s/Documents", home);
+    if (length < 0 || length >= sizeof(path)) {
+        errno = savedErrno;
+        return;
+    }
+    mkdir(path, 0700);
+    length = snprintf(path, sizeof(path), "%s/Documents/LC-NSUserDefaults-diagnostics.log", home);
+    if (length < 0 || length >= sizeof(path)) {
+        errno = savedErrno;
+        return;
+    }
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "litehook diagnostics: open failed: %s (errno=%d)\n", path, errno);
+        errno = savedErrno;
+        return;
+    }
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    uint64_t threadID = 0;
+    pthread_threadid_np(NULL, &threadID);
+    char line[2048];
+    int prefix = snprintf(line, sizeof(line), "[%lld.%06d pid=%d tid=%llu] ",
+                          (long long)now.tv_sec, (int)now.tv_usec, getpid(), (unsigned long long)threadID);
+    va_list args;
+    va_start(args, format);
+    vsnprintf(line + prefix, sizeof(line) - prefix, format, args);
+    va_end(args);
+    size_t size = strnlen(line, sizeof(line) - 2);
+    line[size++] = '\n';
+    size_t written = 0;
+    while (written < size) {
+        ssize_t count = write(fd, line + written, size - written);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) break;
+        written += count;
+    }
+    fsync(fd); // Preserve the last checkpoint if the next operation crashes.
+    close(fd);
+    errno = savedErrno;
+}
 
 #if __arm64__
 #define _COMM_PAGE_START_ADDRESS (0x0000000FFFFFC000ULL)
@@ -348,94 +405,156 @@ void *litehook_find_symbol_file(const mach_header_u *header, const char *symbolN
 
 void *litehook_find_dsc_symbol(const char *imagePath, const char *symbolName)
 {
-	const char *mainDSCPath = litehook_locate_dsc();
-	if (!strlen(mainDSCPath)) return NULL;
+    // Include the requested symbol on every line so concurrent lookups can be separated.
+#define DSC_LOG(fmt, ...) litehook_diagnostic_log("DSC [%s] " fmt, symbolName, ##__VA_ARGS__)
+#define DSC_SEEK(file, offset) do { \
+    if (fseek(file, offset, SEEK_SET) != 0) { \
+        DSC_LOG("FAIL line=%d fseek(%s) offset=%llu errno=%d", __LINE__, #file, (unsigned long long)(offset), errno); \
+        goto end; \
+    } \
+} while (0)
+#define DSC_READ(value, size, file) do { \
+    long position = ftell(file); \
+    if (fread(value, size, 1, file) != 1) { \
+        DSC_LOG("FAIL line=%d fread(%s) offset=%ld size=%zu eof=%d error=%d errno=%d", __LINE__, #value, position, (size_t)(size), feof(file), ferror(file), errno); \
+        goto end; \
+    } \
+} while (0)
+    DSC_LOG("begin image=%s; locating DSC", imagePath);
+    const char *mainDSCPath = litehook_locate_dsc();
+    DSC_LOG("locate DSC returned path=%s", mainDSCPath ?: "(null)");
+    if (!mainDSCPath || !strlen(mainDSCPath)) {
+        DSC_LOG("return NULL: no DSC path");
+        return NULL;
+    }
 
-	char symbolDSCPath[PATH_MAX];
-	strcpy(symbolDSCPath, mainDSCPath);
-	strcat(symbolDSCPath, ".symbols");
+    char symbolDSCPath[PATH_MAX];
+    strcpy(symbolDSCPath, mainDSCPath);
+    strcat(symbolDSCPath, ".symbols");
 
-	void *symbol = NULL;
+    void *symbol = NULL;
 
-	FILE *mainDSC = fopen(mainDSCPath, "rb");
-	if (!mainDSC) goto end;
-	FILE *symbolDSC = fopen(symbolDSCPath, "rb") ?: mainDSC;
+    FILE *symbolDSC = NULL;
+    DSC_LOG("opening main cache: %s", mainDSCPath);
+    FILE *mainDSC = fopen(mainDSCPath, "rb");
+    if (!mainDSC) {
+        DSC_LOG("FAIL fopen main cache errno=%d (%s)", errno, strerror(errno));
+        goto end;
+    }
+    DSC_LOG("opening symbol cache: %s", symbolDSCPath);
+    symbolDSC = fopen(symbolDSCPath, "rb");
+    if (!symbolDSC) {
+        DSC_LOG("fopen .symbols failed errno=%d (%s); falling back to main cache", errno, strerror(errno));
+        symbolDSC = mainDSC;
+    }
 
-	int imageIndex = -1;
+    int imageIndex = -1;
 
-	struct dyld_cache_header mainHeader;
-	if (fread(&mainHeader, sizeof(mainHeader), 1, mainDSC) != 1) goto end;
+    struct dyld_cache_header mainHeader;
+    DSC_READ(&mainHeader, sizeof(mainHeader), mainDSC);
 
-	for (int i = 0; i < mainHeader.imagesCount; i++) {
-		struct dyld_cache_image_info imageInfo;
-		fseek(mainDSC, mainHeader.imagesOffset + sizeof(imageInfo) * i, SEEK_SET);
-		if (fread(&imageInfo, sizeof(imageInfo), 1, mainDSC) != 1) goto end;
+    DSC_LOG("main header magic=%.16s mappingOffset=%u imagesOffset=%u imagesCount=%u localSymbolsOffset=%llu localSymbolsSize=%llu", mainHeader.magic, mainHeader.mappingOffset, mainHeader.imagesOffset, mainHeader.imagesCount, (unsigned long long)mainHeader.localSymbolsOffset, (unsigned long long)mainHeader.localSymbolsSize);
+    DSC_LOG("scanning image table");
+    for (int i = 0; i < mainHeader.imagesCount; i++) {
+        struct dyld_cache_image_info imageInfo;
+        DSC_SEEK(mainDSC, mainHeader.imagesOffset + sizeof(imageInfo) * i);
+        DSC_READ(&imageInfo, sizeof(imageInfo), mainDSC);
 
-		char path[PATH_MAX];
-		fseek(mainDSC, imageInfo.pathFileOffset, SEEK_SET);
-		if (fread(path, PATH_MAX, 1, mainDSC) != 1) goto end;
+        char path[PATH_MAX];
+        DSC_SEEK(mainDSC, imageInfo.pathFileOffset);
+        DSC_READ(path, PATH_MAX, mainDSC);
 
-		if (!strcmp(path, imagePath)) {
-			imageIndex = i;
-			break;
-		}
-	}
+        if (!memchr(path, 0, sizeof(path))) {
+            DSC_LOG("FAIL image path is not terminated index=%d pathOffset=%u", i, imageInfo.pathFileOffset);
+            goto end;
+        }
+        if (!strcmp(path, imagePath)) {
+            DSC_LOG("matched image index=%d pathOffset=%u address=0x%llx", i, imageInfo.pathFileOffset, (unsigned long long)imageInfo.address);
+            imageIndex = i;
+            break;
+        }
+    }
 
-	struct dyld_cache_header symbolHeader;
-	if (fread(&symbolHeader, sizeof(symbolHeader), 1, symbolDSC) != 1) goto end;
+    DSC_LOG("image scan complete index=%d; reading symbol header at offset=%ld fallback=%d", imageIndex, ftell(symbolDSC), symbolDSC == mainDSC);
+    struct dyld_cache_header symbolHeader;
+    DSC_READ(&symbolHeader, sizeof(symbolHeader), symbolDSC);
 
-	struct dyld_cache_local_symbols_info symbolInfo;
-	fseek(symbolDSC, symbolHeader.localSymbolsOffset, SEEK_SET);
-	if (fread(&symbolInfo, sizeof(symbolInfo), 1, symbolDSC) != 1) goto end;
+    DSC_LOG("symbol header magic=%.16s localSymbolsOffset=%llu localSymbolsSize=%llu", symbolHeader.magic, (unsigned long long)symbolHeader.localSymbolsOffset, (unsigned long long)symbolHeader.localSymbolsSize);
+    struct dyld_cache_local_symbols_info symbolInfo;
+    DSC_SEEK(symbolDSC, symbolHeader.localSymbolsOffset);
+    DSC_READ(&symbolInfo, sizeof(symbolInfo), symbolDSC);
 
-	if (imageIndex >= symbolInfo.entriesCount) goto end;
+    DSC_LOG("local symbols nlistOffset=%u nlistCount=%u stringsOffset=%u stringsSize=%u entriesOffset=%u entriesCount=%u imageIndex=%d", symbolInfo.nlistOffset, symbolInfo.nlistCount, symbolInfo.stringsOffset, symbolInfo.stringsSize, symbolInfo.entriesOffset, symbolInfo.entriesCount, imageIndex);
+    if (imageIndex >= symbolInfo.entriesCount) {
+        DSC_LOG("return NULL: image index outside local symbol entries (or image not found)");
+        goto end;
+    }
 
-	struct dyld_cache_local_symbols_entry_64 entry;
+    struct dyld_cache_local_symbols_entry_64 entry;
 
-	if (mainHeader.mappingOffset >= offsetof(struct dyld_cache_header, symbolFileUUID)) {
-		// New shared cache, dyld_cache_local_symbols_entry_64
-		fseek(symbolDSC, symbolHeader.localSymbolsOffset + symbolInfo.entriesOffset + (sizeof(entry) * imageIndex), SEEK_SET);
-		if (fread(&entry, sizeof(entry), 1, symbolDSC) != 1) goto end;
-	}
-	else {
-		// Old shared cache, dyld_cache_local_symbols_entry
-		struct dyld_cache_local_symbols_entry entryOld;
-		fseek(symbolDSC, symbolHeader.localSymbolsOffset + symbolInfo.entriesOffset + (sizeof(entryOld) * imageIndex), SEEK_SET);
-		if (fread(&entryOld, sizeof(entryOld), 1, symbolDSC) != 1) goto end;
+    if (mainHeader.mappingOffset >= offsetof(struct dyld_cache_header, symbolFileUUID)) {
+        DSC_LOG("reading 64-bit local symbol entry");
+        // New shared cache, dyld_cache_local_symbols_entry_64
+        DSC_SEEK(symbolDSC, symbolHeader.localSymbolsOffset + symbolInfo.entriesOffset + (sizeof(entry) * imageIndex));
+        DSC_READ(&entry, sizeof(entry), symbolDSC);
+    }
+    else {
+        DSC_LOG("reading legacy local symbol entry");
+        // Old shared cache, dyld_cache_local_symbols_entry
+        struct dyld_cache_local_symbols_entry entryOld;
+        DSC_SEEK(symbolDSC, symbolHeader.localSymbolsOffset + symbolInfo.entriesOffset + (sizeof(entryOld) * imageIndex));
+        DSC_READ(&entryOld, sizeof(entryOld), symbolDSC);
 
-		// Convert dyld_cache_local_symbols_entry to dyld_cache_local_symbols_entry_64
-		entry = (struct dyld_cache_local_symbols_entry_64) {
-			.dylibOffset = entryOld.dylibOffset,
-			.nlistStartIndex = entryOld.nlistStartIndex,
-			.nlistCount = entryOld.nlistCount,
-		};
-	}
+        // Convert dyld_cache_local_symbols_entry to dyld_cache_local_symbols_entry_64
+        entry = (struct dyld_cache_local_symbols_entry_64) {
+            .dylibOffset = entryOld.dylibOffset,
+            .nlistStartIndex = entryOld.nlistStartIndex,
+            .nlistCount = entryOld.nlistCount,
+        };
+    }
 
-	if ((entry.nlistStartIndex + entry.nlistCount) > symbolInfo.nlistCount) goto end;
+    DSC_LOG("entry dylibOffset=0x%llx nlistStartIndex=%u nlistCount=%u", (unsigned long long)entry.dylibOffset, entry.nlistStartIndex, entry.nlistCount);
+    if ((entry.nlistStartIndex + entry.nlistCount) > symbolInfo.nlistCount) {
+        DSC_LOG("return NULL: entry symbol range exceeds nlistCount");
+        goto end;
+    }
+    DSC_LOG("scanning symbol table");
 
-	for (uint32_t i = entry.nlistStartIndex; i < entry.nlistStartIndex + entry.nlistCount; i++) {
-		struct nlist_64 n;
-		fseek(symbolDSC, symbolHeader.localSymbolsOffset + symbolInfo.nlistOffset + (sizeof(n) * i), SEEK_SET);
-		if (fread(&n, sizeof(n), 1, symbolDSC) != 1) goto end;
+    for (uint32_t i = entry.nlistStartIndex; i < entry.nlistStartIndex + entry.nlistCount; i++) {
+        if ((i - entry.nlistStartIndex) % 1024 == 0) DSC_LOG("symbol scan progress index=%u", i);
+        struct nlist_64 n;
+        DSC_SEEK(symbolDSC, symbolHeader.localSymbolsOffset + symbolInfo.nlistOffset + (sizeof(n) * i));
+        DSC_READ(&n, sizeof(n), symbolDSC);
 
-		fseek(symbolDSC, symbolHeader.localSymbolsOffset + symbolInfo.stringsOffset + n.n_un.n_strx, SEEK_SET);
-		size_t len = _lth_fstrlen(symbolDSC);
-		char curSymbolName[len+1];
-		if (fread(curSymbolName, len+1, 1, symbolDSC) != 1) goto end;
-		if (!strcmp(curSymbolName, symbolName)) {
-			symbol = _litehook_sign_if_executable((void *)(litehook_get_dsc_slide() + n.n_value));
-		}
-	}
+        DSC_SEEK(symbolDSC, symbolHeader.localSymbolsOffset + symbolInfo.stringsOffset + n.n_un.n_strx);
+        size_t len = _lth_fstrlen(symbolDSC);
+        if (len > 4096) DSC_LOG("large symbol name before stack allocation index=%u strx=%u len=%zu", i, n.n_un.n_strx, len);
+        char curSymbolName[len+1];
+        DSC_READ(curSymbolName, len+1, symbolDSC);
+        if (!strcmp(curSymbolName, symbolName)) {
+            DSC_LOG("matched symbol index=%u strx=%u value=0x%llx; obtaining DSC slide", i, n.n_un.n_strx, (unsigned long long)n.n_value);
+            uintptr_t slide = litehook_get_dsc_slide();
+            DSC_LOG("slide=0x%llx candidate=%p; before sign_if_executable", (unsigned long long)slide, (void *)(slide + n.n_value));
+            symbol = _litehook_sign_if_executable((void *)(slide + n.n_value));
+            DSC_LOG("sign_if_executable returned %p", symbol);
+        }
+    }
 
+    DSC_LOG("symbol scan complete result=%p", symbol);
 end:
-	if (mainDSC) {
-		if (symbolDSC != mainDSC) {
-			fclose(symbolDSC);
-		}
-		fclose(mainDSC);
-	}
+    DSC_LOG("cleanup result=%p mainDSC=%p symbolDSC=%p", symbol, mainDSC, symbolDSC);
+    if (mainDSC) {
+        if (symbolDSC && symbolDSC != mainDSC) {
+            fclose(symbolDSC);
+        }
+        fclose(mainDSC);
+    }
 
-	return symbol;
+    DSC_LOG("return %p%s", symbol, symbol ? "" : " (no symbol found / failure above)");
+#undef DSC_READ
+#undef DSC_SEEK
+#undef DSC_LOG
+    return symbol;
 }
 
 void _litehook_rebind_symbol_in_section(const mach_header_u *targetHeader, section_u *section, void *replacee, void *replacement)

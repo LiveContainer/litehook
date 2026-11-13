@@ -17,6 +17,9 @@ typedef struct nlist nlist_u;
 #define LC_SEGMENT_U LC_SEGMENT
 #endif
 
+// Temporary launch diagnostics, appended synchronously to LC_HOME_PATH/Documents.
+void litehook_diagnostic_log(const char *format, ...) __attribute__((format(printf, 1, 2)));
+
 const char *litehook_locate_dsc(void);
 
 void *litehook_find_symbol(const mach_header_u *header, const char *symbolName);
